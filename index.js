@@ -101,7 +101,7 @@ bot.command('reset', (ctx) => {
 
   try {
     const userModel = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
+      model: 'gemini-2.5-flash',
       systemInstruction: getSystemInstruction(session.name),
     });
     session.chat = userModel.startChat({ history: [] });
@@ -151,7 +151,7 @@ bot.on('text', async (ctx) => {
 
     try {
       const userModel = genAI.getGenerativeModel({
-        model: 'gemini-1.5-flash',
+        model: 'gemini-2.5-flash',
         systemInstruction: getSystemInstruction(session.name),
       });
       session.chat = userModel.startChat({ history: [] });
