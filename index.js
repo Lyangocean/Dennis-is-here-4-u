@@ -33,6 +33,9 @@ app.listen(port, () => {
 // 3. Initialize Gemini Generative AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// Models ordered by preference. We try them in order until one works.
+const MODELS = ['gemini-2.5-flash-lite', 'gemini-2.5-flash'];
+
 // System instruction generator
 function getSystemInstruction(userName) {
   return `You are Dennis, a wise, super friendly, and supportive personal AI assistant. You act and talk exactly like Dennis.
@@ -56,57 +59,107 @@ Your styling guidelines:
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
 // User sessions mapping (in-memory state)
-// Structure: { [chatId]: { name, awaitingName, chat } }
 const sessions = new Map();
 
-// Helper function to send message with fallback to gemini-2.5-flash-lite
-async function sendMessageWithFallback(session, messageText) {
-  try {
-    const result = await session.chat.sendMessage(messageText);
-    return result.response.text();
-  } catch (error) {
-    console.error(`Error with primary model ${session.modelName || 'gemini-2.5-flash'}:`, error);
+// Helper: sleep for a given number of milliseconds
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-    // If we've already fallen back, propagate error
-    if (session.modelName === 'gemini-2.5-flash-lite') {
-      throw error;
+// Helper: Create a fresh Gemini chat session for a user
+function createChatSession(userName, modelName) {
+  const model = genAI.getGenerativeModel({
+    model: modelName,
+    systemInstruction: getSystemInstruction(userName),
+  });
+  return model.startChat({ history: [] });
+}
+
+// Helper: Send message with retry + model fallback
+// - Retries up to 2 times on the current model (with 2s delay between retries)
+// - If all retries fail, switches to the next model in the MODELS list
+// - Repeats until all models are exhausted
+async function sendMessageWithRetry(session, messageText) {
+  const modelsToTry = [...MODELS];
+
+  // Move the current model to the front of the list
+  const currentIdx = modelsToTry.indexOf(session.modelName);
+  if (currentIdx > 0) {
+    modelsToTry.splice(currentIdx, 1);
+    modelsToTry.unshift(session.modelName);
+  }
+
+  let lastError = null;
+
+  for (const modelName of modelsToTry) {
+    // If we're switching models, reinitialize the chat
+    if (modelName !== session.modelName) {
+      console.log(`[Fallback] Switching from ${session.modelName} to ${modelName}`);
+      try {
+        // Try to preserve history
+        let history = [];
+        try {
+          history = await session.chat.getHistory();
+        } catch (histErr) {
+          console.log('[Fallback] Could not retrieve history, starting fresh chat.');
+        }
+
+        session.modelName = modelName;
+        const newModel = genAI.getGenerativeModel({
+          model: modelName,
+          systemInstruction: getSystemInstruction(session.name),
+        });
+        session.chat = newModel.startChat({ history });
+      } catch (switchErr) {
+        console.error(`[Fallback] Failed to initialize ${modelName}:`, switchErr.message);
+        continue; // Skip to next model
+      }
     }
 
-    console.log('Attempting automatic fallback to gemini-2.5-flash-lite...');
-    try {
-      // Get chat history from current session
-      const history = await session.chat.getHistory();
+    // Try sending the message up to 3 times on this model
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        console.log(`[Gemini] Sending message with ${modelName} (attempt ${attempt}/3)`);
+        const result = await session.chat.sendMessage(messageText);
+        const text = result.response.text();
+        console.log(`[Gemini] Success with ${modelName} on attempt ${attempt}`);
+        return text;
+      } catch (error) {
+        lastError = error;
+        const errMsg = error.message || String(error);
+        console.error(`[Gemini] ${modelName} attempt ${attempt}/3 failed: ${errMsg}`);
 
-      // Initialize the fallback model
-      session.modelName = 'gemini-2.5-flash-lite';
-      const fallbackModel = genAI.getGenerativeModel({
-        model: session.modelName,
-        systemInstruction: getSystemInstruction(session.name),
-      });
-
-      // Start new chat with identical history
-      session.chat = fallbackModel.startChat({ history });
-
-      // Send the user message again
-      const result = await session.chat.sendMessage(messageText);
-      return result.response.text();
-    } catch (fallbackError) {
-      console.error('Fallback model gemini-2.5-flash-lite also failed:', fallbackError);
-      throw error; // Throw original error so we report it
+        // If it's a rate limit (429) or server error (503), wait and retry
+        if (errMsg.includes('429') || errMsg.includes('503') || errMsg.includes('overloaded') || errMsg.includes('unavailable') || errMsg.includes('quota')) {
+          if (attempt < 3) {
+            const delayMs = attempt * 3000; // 3s, 6s
+            console.log(`[Gemini] Waiting ${delayMs}ms before retry...`);
+            await sleep(delayMs);
+          }
+        } else {
+          // For non-transient errors (e.g. bad request), don't retry on same model
+          console.error(`[Gemini] Non-transient error, skipping remaining retries for ${modelName}`);
+          break;
+        }
+      }
     }
   }
+
+  // All models and retries exhausted
+  console.error('[Gemini] All models and retries exhausted. Last error:', lastError?.message);
+  throw lastError;
 }
 
 // Command: /start
 bot.command('start', (ctx) => {
   const chatId = ctx.chat.id;
-  
-  // Reset session
+  const defaultModel = MODELS[0];
+
   sessions.set(chatId, {
     name: null,
     awaitingName: true,
     chat: null,
-    modelName: 'gemini-2.5-flash'
+    modelName: defaultModel
   });
 
   ctx.reply(
@@ -139,12 +192,8 @@ bot.command('reset', (ctx) => {
   }
 
   try {
-    session.modelName = 'gemini-2.5-flash';
-    const userModel = genAI.getGenerativeModel({
-      model: session.modelName,
-      systemInstruction: getSystemInstruction(session.name),
-    });
-    session.chat = userModel.startChat({ history: [] });
+    session.modelName = MODELS[0];
+    session.chat = createChatSession(session.name, session.modelName);
     sessions.set(chatId, session);
     ctx.reply(`No problem, ${session.name}! I've cleared our previous chat history. What's on your mind now?`);
   } catch (error) {
@@ -176,7 +225,7 @@ bot.on('text', async (ctx) => {
       name: null,
       awaitingName: true,
       chat: null,
-      modelName: 'gemini-2.5-flash'
+      modelName: MODELS[0]
     });
     return ctx.reply("Hey there! Dennis here. I think my memory got refreshed. What was your name again?");
   }
@@ -191,12 +240,8 @@ bot.on('text', async (ctx) => {
     session.awaitingName = false;
 
     try {
-      session.modelName = 'gemini-2.5-flash';
-      const userModel = genAI.getGenerativeModel({
-        model: session.modelName,
-        systemInstruction: getSystemInstruction(session.name),
-      });
-      session.chat = userModel.startChat({ history: [] });
+      session.modelName = MODELS[0];
+      session.chat = createChatSession(session.name, session.modelName);
       sessions.set(chatId, session);
 
       return ctx.reply(
@@ -205,28 +250,39 @@ bot.on('text', async (ctx) => {
       );
     } catch (error) {
       console.error('Error initializing Gemini model:', error);
-      session.awaitingName = true; // reset
+      session.awaitingName = true;
       return ctx.reply("Oops, I had trouble setting up our session. Could you try typing your name again?");
     }
   }
 
   // Regular chat session with Gemini
   try {
-    // Show typing status for premium feel
     await ctx.sendChatAction('typing');
 
-    const responseText = await sendMessageWithFallback(session, messageText);
-    await ctx.reply(responseText);
+    const responseText = await sendMessageWithRetry(session, messageText);
+
+    // Telegram has a 4096 character limit per message. Split if needed.
+    if (responseText.length > 4000) {
+      const chunks = responseText.match(/[\s\S]{1,4000}/g) || [responseText];
+      for (const chunk of chunks) {
+        await ctx.reply(chunk);
+      }
+    } else {
+      await ctx.reply(responseText);
+    }
   } catch (error) {
-    console.error('Error during Gemini API call:', error);
-    await ctx.reply("Sorry, I hit a snag while thinking. Can you try sending that message again?");
+    console.error('[Bot] Final error after all retries:', error.message);
+    await ctx.reply(
+      "I'm really sorry, but Google's AI servers are experiencing issues right now. " +
+      "Please try again in a minute or two! Dennis will be right here waiting for you. 🙏"
+    );
   }
 });
 
 // Start the bot using Long Polling
 bot.launch()
   .then(() => {
-    console.log('[Telegram] Dennis AI Bot successfully started and polling messages...');
+    console.log(`[Telegram] Dennis AI Bot started. Primary model: ${MODELS[0]}, Fallback: ${MODELS[1]}`);
   })
   .catch((err) => {
     console.error('[Telegram] Failed to start bot:', err);
