@@ -59,6 +59,44 @@ const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 // Structure: { [chatId]: { name, awaitingName, chat } }
 const sessions = new Map();
 
+// Helper function to send message with fallback to gemini-2.5-flash-lite
+async function sendMessageWithFallback(session, messageText) {
+  try {
+    const result = await session.chat.sendMessage(messageText);
+    return result.response.text();
+  } catch (error) {
+    console.error(`Error with primary model ${session.modelName || 'gemini-2.5-flash'}:`, error);
+
+    // If we've already fallen back, propagate error
+    if (session.modelName === 'gemini-2.5-flash-lite') {
+      throw error;
+    }
+
+    console.log('Attempting automatic fallback to gemini-2.5-flash-lite...');
+    try {
+      // Get chat history from current session
+      const history = await session.chat.getHistory();
+
+      // Initialize the fallback model
+      session.modelName = 'gemini-2.5-flash-lite';
+      const fallbackModel = genAI.getGenerativeModel({
+        model: session.modelName,
+        systemInstruction: getSystemInstruction(session.name),
+      });
+
+      // Start new chat with identical history
+      session.chat = fallbackModel.startChat({ history });
+
+      // Send the user message again
+      const result = await session.chat.sendMessage(messageText);
+      return result.response.text();
+    } catch (fallbackError) {
+      console.error('Fallback model gemini-2.5-flash-lite also failed:', fallbackError);
+      throw error; // Throw original error so we report it
+    }
+  }
+}
+
 // Command: /start
 bot.command('start', (ctx) => {
   const chatId = ctx.chat.id;
@@ -67,7 +105,8 @@ bot.command('start', (ctx) => {
   sessions.set(chatId, {
     name: null,
     awaitingName: true,
-    chat: null
+    chat: null,
+    modelName: 'gemini-2.5-flash'
   });
 
   ctx.reply(
@@ -100,8 +139,9 @@ bot.command('reset', (ctx) => {
   }
 
   try {
+    session.modelName = 'gemini-2.5-flash';
     const userModel = genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
+      model: session.modelName,
       systemInstruction: getSystemInstruction(session.name),
     });
     session.chat = userModel.startChat({ history: [] });
@@ -135,7 +175,8 @@ bot.on('text', async (ctx) => {
     sessions.set(chatId, {
       name: null,
       awaitingName: true,
-      chat: null
+      chat: null,
+      modelName: 'gemini-2.5-flash'
     });
     return ctx.reply("Hey there! Dennis here. I think my memory got refreshed. What was your name again?");
   }
@@ -150,8 +191,9 @@ bot.on('text', async (ctx) => {
     session.awaitingName = false;
 
     try {
+      session.modelName = 'gemini-2.5-flash';
       const userModel = genAI.getGenerativeModel({
-        model: 'gemini-2.5-flash',
+        model: session.modelName,
         systemInstruction: getSystemInstruction(session.name),
       });
       session.chat = userModel.startChat({ history: [] });
@@ -173,9 +215,7 @@ bot.on('text', async (ctx) => {
     // Show typing status for premium feel
     await ctx.sendChatAction('typing');
 
-    const result = await session.chat.sendMessage(messageText);
-    const responseText = result.response.text();
-    
+    const responseText = await sendMessageWithFallback(session, messageText);
     await ctx.reply(responseText);
   } catch (error) {
     console.error('Error during Gemini API call:', error);
