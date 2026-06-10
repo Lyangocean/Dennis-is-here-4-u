@@ -279,16 +279,46 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// Start the bot using Long Polling
-bot.launch()
-  .then(() => {
+// Global error handler for the bot — catch polling errors so the process doesn't crash
+bot.catch((err, ctx) => {
+  console.error(`[Bot] Error for update ${ctx.updateType}:`, err.message);
+});
+
+// Launch the bot with automatic restart on failure
+async function startBot() {
+  try {
+    await bot.launch();
     console.log(`[Telegram] Dennis AI Bot started. Primary model: ${MODELS[0]}, Fallback: ${MODELS[1]}`);
-  })
-  .catch((err) => {
-    console.error('[Telegram] Failed to start bot:', err);
-    process.exit(1);
-  });
+  } catch (err) {
+    console.error('[Telegram] Failed to start bot:', err.message);
+    console.log('[Telegram] Retrying in 10 seconds...');
+    await sleep(10000);
+    return startBot(); // Retry
+  }
+}
+
+startBot();
+
+// Self-ping keep-alive: prevents Render free tier from sleeping
+// Pings our own health endpoint every 10 minutes
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${port}`;
+setInterval(async () => {
+  try {
+    const response = await fetch(`${RENDER_URL}/`);
+    console.log(`[KeepAlive] Self-ping OK (status: ${response.status})`);
+  } catch (err) {
+    console.log(`[KeepAlive] Self-ping failed: ${err.message}`);
+  }
+}, 10 * 60 * 1000); // Every 10 minutes
 
 // Handle graceful stops
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+// Catch unhandled errors so the process stays alive
+process.on('uncaughtException', (err) => {
+  console.error('[Process] Uncaught exception:', err.message);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[Process] Unhandled rejection:', err);
+});
